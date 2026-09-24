@@ -1,0 +1,501 @@
+# Onramp reviewed build: slack-mcp-server v1.3.0 at a079b3c (OPS-768).
+#
+# Builds the Go binary from the exact reviewed commit, records SHA-256
+# checksums, checks that two independent runners produce identical bytes,
+# and stages a DRAFT release. It never pushes, tags or publishes.
+#
+# Branch layout: onramp/reviewed-build = a079b3c + one commit that adds this
+# file and deletes the five upstream workflows (release, release-image,
+# unit-tests, integration-tests, security-trivy), so that publishing the draft
+# (which creates a tag on the branch commit) cannot fire the upstream
+# tag-triggered release jobs. The build jobs check out a079b3c itself, so the
+# branch commit never enters the binaries.
+#
+# Optional, dispatch-only: `attest` writes a Sigstore build-provenance
+# attestation. That is a permanent public record; run it only with Program
+# Owner approval.
+#
+# Two informational jobs never block the build:
+#   upstream-repro  replays the upstream npm build (go1.25.9, upstream flags)
+#                   and compares it with the npm 1.3.0 binaries.
+#   vulncheck       runs govulncheck on the reviewed source and on the npm
+#                   linux-amd64 binary.
+name: Onramp reviewed build
+
+on:
+  push:
+    branches:
+      - onramp/reviewed-build
+  workflow_dispatch:
+    inputs:
+      release_draft:
+        description: Create or update the draft release after the builds match
+        type: boolean
+        default: true
+      attest:
+        description: Write a Sigstore build-provenance attestation (permanent public record; Program Owner approval required)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onramp-reviewed-build
+  cancel-in-progress: false
+
+env:
+  REVIEWED_COMMIT: a079b3cd4d5836d791c942a9fc107987e7865b37
+  REVIEWED_TREE: 2f5a4270c0aec35386d07d99f9a449c26e188fed
+  REVIEWED_TAG: v1.3.0
+  SOURCE_DATE: "2026-05-14T22:46:32Z"
+  # go.mod declares `go 1.25` with no toolchain line. 1.25.14 is the final
+  # patch on that line; the build checks it against go.mod before running.
+  # Go 1.25 left upstream support when Go 1.27.0 shipped (2026-08-19); moving
+  # to a supported toolchain is a separate Program Owner decision (OPS-768).
+  GO_VERSION: "1.25.14"
+  GOTOOLCHAIN: local
+  PKG: github.com/korotovsky/slack-mcp-server
+  RELEASE_TAG: onramp-reviewed-v1.3.0-a079b3c
+  TARGETS: darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64
+
+jobs:
+  build:
+    name: Clean build on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    env:
+      GOFLAGS: -mod=readonly
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify commit, tree and a clean working copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVIEWED_COMMIT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$REVIEWED_TREE"
+          test "$(TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" = "$SOURCE_DATE"
+          test -z "$(git status --porcelain)"
+          # Local tag only, never pushed: lets Go stamp the module version as v1.3.0.
+          git tag "$REVIEWED_TAG" "$REVIEWED_COMMIT"
+
+      - name: Check GO_VERSION is on the go.mod line
+        shell: bash
+        run: |
+          set -euo pipefail
+          mod_go=$(awk '$1 == "go" { print $2; exit }' go.mod)
+          echo "go.mod: go $mod_go; building with go$GO_VERSION"
+          if grep -q '^toolchain ' go.mod; then
+            grep '^toolchain ' go.mod
+            echo "::error::go.mod pins a toolchain; align GO_VERSION with it"
+            exit 1
+          fi
+          case "$GO_VERSION" in
+            "$mod_go" | "$mod_go".*) ;;
+            *) echo "::error::GO_VERSION $GO_VERSION is not on the go.mod line $mod_go"; exit 1 ;;
+          esac
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: false
+
+      - name: Verify the toolchain and module checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = "go$GO_VERSION"
+          go mod download
+          go mod verify
+
+      - name: Build six platforms (CGO off, trimpath, fixed ldflags)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -buildid= -X '$PKG/pkg/version.CommitHash=$REVIEWED_COMMIT' -X '$PKG/pkg/version.Version=$REVIEWED_TAG' -X '$PKG/pkg/version.BuildTime=$SOURCE_DATE' -X '$PKG/pkg/version.BinaryName=slack-mcp-server'"
+          for target in $TARGETS; do
+            os="${target%/*}"; arch="${target#*/}"; ext=""
+            if [ "$os" = windows ]; then ext=".exe"; fi
+            # build/slack-mcp-server-* is git-ignored upstream, so outputs never dirty the tree.
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" \
+              -o "build/slack-mcp-server-$os-$arch$ext" ./cmd/slack-mcp-server
+          done
+          test -z "$(git status --porcelain)"
+
+      - name: Record build info and SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          cd build
+          for f in slack-mcp-server-*; do
+            go version -m "$f" > "$out/buildinfo-$f.txt"
+            grep -q "vcs.revision=$REVIEWED_COMMIT" "$out/buildinfo-$f.txt"
+            grep -q "vcs.modified=false" "$out/buildinfo-$f.txt"
+            cp "$f" "$out/"
+          done
+          cd "$out"
+          shasum -a 256 slack-mcp-server-* > SHA256SUMS
+          go version > toolchain.txt
+          {
+            echo "### SHA-256, clean build on $RUNNER_OS (go$GO_VERSION)"
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: onramp-build-${{ runner.os }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    name: Builds match across runners
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download both builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: onramp-build-*
+          path: artifacts
+
+      - name: Compare checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          a=artifacts/onramp-build-Linux
+          b=artifacts/onramp-build-macOS
+          (cd "$a" && shasum -a 256 -c SHA256SUMS)
+          (cd "$b" && shasum -a 256 -c SHA256SUMS)
+          if diff -u "$a/SHA256SUMS" "$b/SHA256SUMS"; then
+            result="IDENTICAL: the Linux and macOS runners produced the same bytes."
+          else
+            echo "::error::The two runners produced different binaries."
+            exit 1
+          fi
+          mkdir -p final
+          cp "$a/SHA256SUMS" "$a"/buildinfo-*.txt "$a/toolchain.txt" final/
+          {
+            echo "### Reviewed build of $REVIEWED_TAG at $REVIEWED_COMMIT"
+            echo "$result"
+            echo '```'
+            cat "$a/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare with the checksums pre-computed for the memo (informational)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recorded 2026-09-23 from two local builds (go1.25.14, darwin/arm64 host),
+          # memo slack-mcp-server-source-build_2026-09-23.md. A mismatch is a finding, not a build failure.
+          cat > expected-SHA256SUMS <<'EOF'
+          a0110ccc9b891be0f2a3662aa26b983867be46551bcb5ba6ea52e067a894136e  slack-mcp-server-darwin-amd64
+          018082dda16eec0bc477d84932e6b8cfcae7d144595327df907237ba08147c37  slack-mcp-server-darwin-arm64
+          a18ded3cee40198ed9668f1e089edde8b461fdbecfaaf8abaa5d9e798c0f577c  slack-mcp-server-linux-amd64
+          92a4455be7db4683fbc202052c3097f9960d73865a667b3465fe0b6aa381d38f  slack-mcp-server-linux-arm64
+          c3a98a7dfce98939c33b2c8826c12487994b7c55d17739a40c7f01dae58f3e1f  slack-mcp-server-windows-amd64.exe
+          40ded41041185dc36ae62f617f944e46cb7e8a04bd1dd423fe068fd0ec99bc9e  slack-mcp-server-windows-arm64.exe
+          EOF
+          if diff -u expected-SHA256SUMS final/SHA256SUMS; then
+            r="MATCH: CI output equals the checksums recorded in the memo."
+          else
+            r="DIFFER: CI output does not equal the memo checksums; record both and investigate."
+            echo "::warning::$r"
+          fi
+          echo "### Memo cross-check: $r" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: onramp-reviewed-build-SHA256SUMS
+          path: final/
+          if-no-files-found: error
+          retention-days: 90
+
+  release-draft:
+    name: Stage the draft release
+    needs: verify
+    if: github.event_name == 'push' || inputs.release_draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download the Linux build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: onramp-build-Linux
+          path: dist
+
+      - name: Create or update the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 -c SHA256SUMS
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Onramp reviewed build of slack-mcp-server $REVIEWED_TAG. DRAFT: do not publish without Program Owner approval (OPS-768)."
+            echo
+            echo "- Source: commit $REVIEWED_COMMIT (tree $REVIEWED_TREE), checked out and verified by the workflow."
+            echo "- Toolchain: $(cat toolchain.txt). CGO_ENABLED=0, -trimpath, -mod=readonly, BuildTime fixed to the commit time ($SOURCE_DATE)."
+            echo "- Reproducibility: the Linux and macOS runners produced identical bytes (job 'Builds match across runners')."
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "SHA-256:"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > "$notes"
+          files=(slack-mcp-server-* SHA256SUMS buildinfo-*.txt)
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::$RELEASE_TAG is already published; this workflow only edits drafts."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" \
+              --title "slack-mcp-server $REVIEWED_TAG (Onramp reviewed build, a079b3c)" \
+              --notes-file "$notes" "${files[@]}"
+          fi
+
+  attest:
+    name: Sigstore build provenance (dispatch only, opt-in)
+    needs: verify
+    if: github.event_name == 'workflow_dispatch' && inputs.attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the Linux build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: onramp-build-Linux
+          path: dist
+
+      - name: Re-check the checksums
+        shell: bash
+        run: cd dist && shasum -a 256 -c SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/slack-mcp-server-*
+
+  upstream-repro:
+    name: Replay the upstream npm build (informational)
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    env:
+      UPSTREAM_GO: "1.25.9"
+      NPM_VERSION: "1.3.0"
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Tag locally (never pushed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVIEWED_COMMIT"
+          git tag "$REVIEWED_TAG" "$REVIEWED_COMMIT"
+
+      - name: Set up the upstream toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.UPSTREAM_GO }}
+          check-latest: false
+          cache: false
+
+      - name: Replay the upstream pre-build steps and record what they change
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/repro"
+          mkdir -p "$out"
+          test "$(go env GOVERSION)" = "go$UPSTREAM_GO"
+          # The upstream Makefile target build-all-platforms runs clean, tidy and format first.
+          go mod tidy
+          go fmt ./... | tee "$out/gofmt-rewritten-files.txt"
+          git status --porcelain | tee "$out/tree-status.txt"
+          git diff > "$out/tree-diff.patch"
+          if [ ! -s "$out/tree-status.txt" ]; then
+            echo "Tree clean after tidy and fmt; adding an untracked marker so vcs.modified=true matches the npm binaries." | tee "$out/marker-note.txt"
+            touch .onramp-repro-marker
+          fi
+          {
+            echo "### Upstream replay: working-tree changes after go mod tidy and go fmt (go$UPSTREAM_GO)"
+            echo '```'
+            cat "$out/tree-status.txt"
+            git diff --stat
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebuild with the upstream npm flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in $TARGETS; do
+            os="${target%/*}"; arch="${target#*/}"; ext=""
+            if [ "$os" = windows ]; then ext=".exe"; fi
+            # BuildTime values as embedded in the npm 1.3.0 binaries.
+            case "$os" in
+              darwin) bt="2026-05-14T22:55:09Z" ;;
+              *) bt="2026-05-14T22:55:10Z" ;;
+            esac
+            LDFLAGS="-s -w -X '$PKG/pkg/version.CommitHash=$REVIEWED_COMMIT' -X '$PKG/pkg/version.Version=v1.3.0-dirty' -X '$PKG/pkg/version.BuildTime=$bt' -X '$PKG/pkg/version.BinaryName=slack-mcp-server'"
+            GOOS="$os" GOARCH="$arch" go build -ldflags "$LDFLAGS" \
+              -o "./build/slack-mcp-server-$os-$arch$ext" ./cmd/slack-mcp-server
+          done
+
+      - name: Compare with the npm 1.3.0 binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/repro"
+          mkdir -p "$out/npm"
+          # SHA-256 of the binaries inside the npm 1.3.0 tarballs, recorded 2026-09-23.
+          expected() {
+            case "$1" in
+              darwin-amd64) echo baa367f79a5bf99542f253d13289b8c6ed1c501b79dd5bedc4e7850ffff43a25 ;;
+              darwin-arm64) echo 8f0ba1fff09d61d51a090ef447995f778c0fd7234d6f1d6c568cb2fba0e7da83 ;;
+              linux-amd64) echo 91637bd00d6194eec421c23d9df5e8ee3b8ed29dd05d3c6a8c2e1825c69e67ce ;;
+              linux-arm64) echo 455971bd9763a1a638fa2d6a4ea92682a5b03a2e03e17a4b4a5e8cb6cd78ed0e ;;
+              windows-amd64) echo 46cd05d547bb108b568e85f9cc8bdcd817aef77d714d9354ed069a2d5886e063 ;;
+              windows-arm64) echo 754f4231495bda582ed873150ad129a4334d9f87c07c9d07b5af924519b95728 ;;
+            esac
+          }
+          table="$out/comparison.md"
+          echo "| Platform | npm binary SHA-256 | Replayed build SHA-256 | Result |" > "$table"
+          echo "|---|---|---|---|" >> "$table"
+          for target in $TARGETS; do
+            os="${target%/*}"; arch="${target#*/}"; ext=""
+            if [ "$os" = windows ]; then ext=".exe"; fi
+            p="$os-$arch"
+            name="slack-mcp-server-$p"
+            meta=$(curl -fsSL "https://registry.npmjs.org/$name/$NPM_VERSION")
+            want_sha1=$(printf '%s' "$meta" | jq -r .dist.shasum)
+            curl -fsSL -o "$out/npm/$name.tgz" "https://registry.npmjs.org/$name/-/$name-$NPM_VERSION.tgz"
+            test "$(shasum -a 1 "$out/npm/$name.tgz" | cut -d' ' -f1)" = "$want_sha1"
+            tar -xzf "$out/npm/$name.tgz" -C "$out/npm" "package/bin/$name$ext"
+            npm_sha=$(shasum -a 256 "$out/npm/package/bin/$name$ext" | cut -d' ' -f1)
+            test "$npm_sha" = "$(expected "$p")"
+            repro_sha=$(shasum -a 256 "build/$name$ext" | cut -d' ' -f1)
+            go version -m "$out/npm/package/bin/$name$ext" | sed 1d > "$out/npm-buildinfo-$p.txt"
+            go version -m "build/$name$ext" | sed 1d > "$out/replay-buildinfo-$p.txt"
+            if [ "$npm_sha" = "$repro_sha" ]; then r=MATCH; else r=DIFFER; fi
+            diff -u "$out/npm-buildinfo-$p.txt" "$out/replay-buildinfo-$p.txt" > "$out/buildinfo-diff-$p.txt" || true
+            echo "| $p | \`$npm_sha\` | \`$repro_sha\` | $r |" >> "$table"
+          done
+          rm -rf "$out/npm"
+          {
+            echo "### Upstream replay vs npm $NPM_VERSION binaries"
+            cat "$table"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the replay record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: onramp-upstream-repro
+          path: ${{ runner.temp }}/repro/
+          if-no-files-found: warn
+          retention-days: 90
+
+  vulncheck:
+    name: govulncheck (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: false
+
+      # v1.7.0 is the newest govulncheck that builds with go1.25 (v1.8.0 requires go1.26).
+      - name: Install govulncheck v1.7.0
+        shell: bash
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Scan the reviewed source and the npm linux-amd64 binary
+        shell: bash
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/vuln"
+          mkdir -p "$out"
+          gv="$(go env GOPATH)/bin/govulncheck"
+          "$gv" -version > "$out/govulncheck-version.txt" 2>&1 || true
+          "$gv" -show verbose ./... > "$out/source-go$GO_VERSION.txt" 2>&1
+          echo "source scan exit code: $?" >> "$out/source-go$GO_VERSION.txt"
+          name=slack-mcp-server-linux-amd64
+          curl -fsSL -o "$RUNNER_TEMP/$name.tgz" "https://registry.npmjs.org/$name/-/$name-1.3.0.tgz"
+          tar -xzf "$RUNNER_TEMP/$name.tgz" -C "$RUNNER_TEMP" "package/bin/$name"
+          if [ "$(shasum -a 256 "$RUNNER_TEMP/package/bin/$name" | cut -d' ' -f1)" = "91637bd00d6194eec421c23d9df5e8ee3b8ed29dd05d3c6a8c2e1825c69e67ce" ]; then
+            "$gv" -mode=binary -show verbose "$RUNNER_TEMP/package/bin/$name" > "$out/npm-linux-amd64-binary.txt" 2>&1
+            echo "binary scan exit code: $?" >> "$out/npm-linux-amd64-binary.txt"
+          else
+            echo "npm binary checksum mismatch; not scanned" > "$out/npm-linux-amd64-binary.txt"
+          fi
+          {
+            echo "### govulncheck, reviewed source (go$GO_VERSION standard library)"
+            echo '```'
+            grep -E '^(Vulnerability #|Your code|=== |No vulnerabilities|source scan exit)' "$out/source-go$GO_VERSION.txt" || true
+            echo '```'
+            echo "### govulncheck, npm 1.3.0 linux-amd64 binary (go1.25.9)"
+            echo '```'
+            grep -E '^(Vulnerability #|Your code|=== |No vulnerabilities|binary scan exit)' "$out/npm-linux-amd64-binary.txt" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the scan results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: onramp-govulncheck
+          path: ${{ runner.temp }}/vuln/
+          if-no-files-found: warn
+          retention-days: 90
