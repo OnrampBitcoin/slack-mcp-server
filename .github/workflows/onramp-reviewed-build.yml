@@ -1,8 +1,9 @@
 # Onramp reviewed build: slack-mcp-server v1.3.0 at a079b3c (OPS-768).
 #
 # Builds the Go binary from the exact reviewed commit, records SHA-256
-# checksums, checks that two independent runners produce identical bytes,
-# and stages a DRAFT release. It never pushes, tags or publishes.
+# checksums and checks that two independent runners produce identical bytes.
+# It never pushes, tags or publishes. The release-draft job is switched off,
+# so the existing go1.25.14 draft release is left untouched.
 #
 # Branch layout: onramp/reviewed-build = a079b3c + one commit that adds this
 # file and deletes the five upstream workflows (release, release-image,
@@ -49,11 +50,11 @@ env:
   REVIEWED_TREE: 2f5a4270c0aec35386d07d99f9a449c26e188fed
   REVIEWED_TAG: v1.3.0
   SOURCE_DATE: "2026-05-14T22:46:32Z"
-  # go.mod declares `go 1.25` with no toolchain line. 1.25.14 is the final
-  # patch on that line; the build checks it against go.mod before running.
-  # Go 1.25 left upstream support when Go 1.27.0 shipped (2026-08-19); moving
-  # to a supported toolchain is a separate Program Owner decision (OPS-768).
-  GO_VERSION: "1.25.14"
+  # go.mod declares `go 1.25` (a minimum) with no toolchain line. Go 1.25 left
+  # upstream support when Go 1.27.0 shipped (2026-08-19), so the reviewed
+  # source is built with a supported toolchain; the build checks it is at
+  # least the go.mod minimum before running.
+  GO_VERSION: "1.27.1"
   GOTOOLCHAIN: local
   PKG: github.com/korotovsky/slack-mcp-server
   RELEASE_TAG: onramp-reviewed-v1.3.0-a079b3c
@@ -90,7 +91,7 @@ jobs:
           # Local tag only, never pushed: lets Go stamp the module version as v1.3.0.
           git tag "$REVIEWED_TAG" "$REVIEWED_COMMIT"
 
-      - name: Check GO_VERSION is on the go.mod line
+      - name: Check GO_VERSION is at least the go.mod minimum
         shell: bash
         run: |
           set -euo pipefail
@@ -101,10 +102,10 @@ jobs:
             echo "::error::go.mod pins a toolchain; align GO_VERSION with it"
             exit 1
           fi
-          case "$GO_VERSION" in
-            "$mod_go" | "$mod_go".*) ;;
-            *) echo "::error::GO_VERSION $GO_VERSION is not on the go.mod line $mod_go"; exit 1 ;;
-          esac
+          if [ "$(printf '%s\n' "$mod_go" "$GO_VERSION" | sort -V | head -n 1)" != "$mod_go" ]; then
+            echo "::error::GO_VERSION $GO_VERSION is older than the go.mod minimum $mod_go"
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -235,7 +236,9 @@ jobs:
   release-draft:
     name: Stage the draft release
     needs: verify
-    if: github.event_name == 'push' || inputs.release_draft
+    # Switched off: the existing draft release onramp-reviewed-v1.3.0-a079b3c
+    # holds the reviewed go1.25.14 assets and must not be overwritten.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -456,10 +459,10 @@ jobs:
           check-latest: false
           cache: false
 
-      # v1.7.0 is the newest govulncheck that builds with go1.25 (v1.8.0 requires go1.26).
-      - name: Install govulncheck v1.7.0
+      # v1.8.0 requires go1.26 or later.
+      - name: Install govulncheck v1.8.0
         shell: bash
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       - name: Scan the reviewed source and the npm linux-amd64 binary
         shell: bash
